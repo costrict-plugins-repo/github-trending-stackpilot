@@ -1,0 +1,27 @@
+.worktrees/
+.claude/
+
+# Session-local skill working dirs (untracked, not part of repo)
+.superpowers/
+claude-config/skills/*/systematic-debugging/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Runtime
+.stackpilot/tasks/
+.stackpilot/path
+*.log
+
+# Local design/spec drafts
+docs/superpowers/
+.stackpilot/runs/
+.stackpilot/views/

@@ -1,0 +1,403 @@
+# Sprint Finish
+
+Run after all tasks are done. Confirms tests pass, optionally starts dev
+server for preview, then surfaces the sprint outcome in terminal by default.
+Generate `finish-report.html` only when browser charts/timelines/editable
+review materially improve the merge/PR/keep/discard decision.
+
+Inputs assumed present: `.stackpilot/runs/<slug>/handoff.json` for controller
+resume state, `.stackpilot/runs/<slug>/TASK-*/state.json` for elapsed/phase
+data, `.stackpilot/specs/<slug>-criteria.md` for criteria, agent reports for
+Pattern/Decision Candidates, `git log <base>..HEAD` for the commits list,
+`.stackpilot/runs/<slug>/events.jsonl` for durable dispatch / verification /
+decision evidence, and `.stackpilot/feedback/open/*.md` for external audit
+feedback.
+
+## Action Safety Gate
+
+This gate is active for the whole Finish flow, including auto mode. Do not
+execute or silently approve force push, remote delete, production database
+mutation, credential or secret movement, deployment, public network upload of
+repository data, destructive cloud/app/MCP actions, or disabling verification
+checks without explicit user confirmation. Record the decision in
+`.stackpilot/runs/<slug>/events.jsonl`.
+
+## Step 0 — Pre-merge verification gate
+
+Before anything else, run the project's verification suite. Read `stackpilot.config.yml` for `qa.test_command`.
+
+```bash
+# 1. Type check (if available)
+npx tsc --noEmit 2>&1 || true
+# 2. Lint (if available)
+npm run lint 2>&1 || true
+# 3. Test suite
+<test_command from config>
+```
+
+Auto-detect which checks exist (don't fail on missing tools). Report results:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  Pre-Merge Gate
+━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Type check     passed
+⚠️  Lint           3 warnings (non-blocking)
+✅ Tests          47/47 passed
+━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+- All green → proceed to Step 1
+- Test failures → report and ask: "Tests failing. Fix before merge, or proceed anyway?"
+- Type errors → report and ask: same pattern
+
+Do NOT silently skip verification.
+
+## Step 0.25 — Sprint evals
+
+Before the closure gate, derive a compact retrospective from data-layer
+evidence and write it to `.stackpilot/runs/<slug>/sprint-evals.md`.
+
+Required inputs:
+
+- `.stackpilot/runs/<slug>/events.jsonl`
+- `.stackpilot/runs/<slug>/TASK-*/state.json`
+- latest `.stackpilot/specs/*-criteria.md`
+
+Required sections:
+
+```markdown
+# Sprint Evals — <slug>
+
+## Summary
+- tasks_total:
+- tasks_complete:
+- tasks_soft_blocked:
+- tasks_critical:
+- criteria_pass:
+- criteria_fail_or_untested:
+
+## Loop Health
+- verify_fix_rounds:
+- retry_count:
+- common_failing_gates:
+- plateau_or_stuck_notes:
+
+## Recommendation
+stop | continue | change-strategy
+```
+
+Look specifically for plateau/stuck signals: repeated `retry_count`, repeated
+verify/fix rounds on the same command, unchanged failing gates across waves, or
+a high keep/revert churn pattern in events. The recommendation should be
+actionable: `stop` when all gates are green, `continue` when remaining work is
+bounded, and `change-strategy` when evidence shows saturation.
+
+Append a `sprint-evals-written` event to `events.jsonl` and update
+`handoff.json` with `phase: "finish"`, `status: "evaluated"`, and
+`next_action: "run closure gate"`.
+
+## Step 0.4 — Feedback inbox gate
+
+Initialize the external audit inbox and never silently ignore it:
+
+```bash
+mkdir -p .stackpilot/feedback/open .stackpilot/feedback/resolved
+find .stackpilot/feedback/open -maxdepth 1 -name '*.md' -type f -print
+```
+
+Treat each open Markdown file as human or external review feedback. Summarize by
+target and severity before merge decisions. If any unresolved HIGH or CRITICAL
+feedback remains, surface it in terminal and ask whether to fix now, defer with
+a recorded reason, or override the gate. Auto mode cannot silently override this
+gate.
+
+When feedback is handled, append a `# Resolution` section to the file with the
+decision, evidence, and commit or command references, then move it to
+`.stackpilot/feedback/resolved/`. Keep unresolved items in
+`.stackpilot/feedback/open/` so the next sprint sees them.
+
+## Step 0.5 — Sprint Closure Gate
+
+After Step 0 tech checks pass, verify sprint **business completeness** before allowing merge. 4 sub-gates.
+
+### Gate 1: Acceptance criteria all green
+
+```bash
+CRITERIA=$(ls -t .stackpilot/specs/*-criteria.md 2>/dev/null | head -1)
+if [ -z "${CRITERIA}" ]; then
+  echo "⚠ Gate 1: no acceptance-criteria.md found — Phase 3.6 may have been skipped (legacy sprint?)"
+  # Don't block merge for legacy sprints that pre-date Phase 3.6
+else
+  NOT_GREEN=$(grep -E '^\| C[0-9]+ \|' "${CRITERIA}" \
+    | awk -F'|' '{print $5}' | tr -d ' ' \
+    | grep -cE 'untested|fail')
+  if [ "${NOT_GREEN}" -gt 0 ]; then
+    echo "❌ Gate 1: ${NOT_GREEN} criterion(s) not green in ${CRITERIA}"
+    grep -E '\| (untested|fail) \|' "${CRITERIA}"
+    GATE_FAILED=1
+  else
+    echo "✅ Gate 1: all acceptance criteria green"
+  fi
+fi
+```
+
+Allowed Status values: `pass`, `n-a-this-task`. Both count as green. `untested` and `fail` block merge.
+
+### Gate 2: CHANGELOG updated
+
+```bash
+BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)
+SPRINT_COMMITS=$(git log "${BASE}..HEAD" --format='%s')
+UNRELEASED=$(awk '/^## \[Unreleased\]/,/^## \[[0-9]/' CHANGELOG.md 2>/dev/null | head -200)
+
+MISSING_SCOPES=()
+while IFS= read -r commit_msg; do
+  [ -z "${commit_msg}" ] && continue
+  # Extract scope from conventional commit (e.g. "feat(auth): ..." → "auth")
+  SCOPE=$(echo "${commit_msg}" | grep -oP '^\w+\(\K[^)]+' || echo "")
+  if [ -n "${SCOPE}" ] && ! echo "${UNRELEASED}" | grep -qi "${SCOPE}"; then
+    MISSING_SCOPES+=("${SCOPE}")
+  fi
+done <<< "${SPRINT_COMMITS}"
+
+# Dedupe
+UNIQUE_MISSING=$(printf '%s\n' "${MISSING_SCOPES[@]}" | sort -u | grep -v '^$' | wc -l | tr -d ' ')
+if [ "${UNIQUE_MISSING}" -gt 0 ]; then
+  echo "❌ Gate 2: ${UNIQUE_MISSING} sprint scope(s) missing from CHANGELOG Unreleased:"
+  printf '%s\n' "${MISSING_SCOPES[@]}" | sort -u | grep -v '^$' | sed 's/^/  · /'
+  GATE_FAILED=1
+else
+  echo "✅ Gate 2: CHANGELOG Unreleased covers sprint scopes"
+fi
+```
+
+Skip Gate 2 if `CHANGELOG.md` does not exist (project doesn't keep a changelog).
+
+### Gate 3: Review Patterns candidates surfaced
+
+```bash
+# sp-qa reports may contain "## Pattern Candidates" blocks during the sprint
+# Look for unprocessed candidates (warning only, Step 4a handles the merge prompt)
+CANDIDATES=$(find .stackpilot/runs -name "qa-report*.md" -newer .stackpilot/ARCHITECTURE.md 2>/dev/null \
+  | xargs awk '/^## Pattern Candidates/,/^## [^P]/' 2>/dev/null \
+  | grep -cE '^- \[' || echo 0)
+
+if [ "${CANDIDATES}" -gt 0 ]; then
+  echo "⚠ Gate 3: ${CANDIDATES} Pattern Candidate(s) from sp-qa pending → Step 4a will prompt for merge"
+else
+  echo "✅ Gate 3: no pending Pattern Candidates"
+fi
+```
+
+Gate 3 is informational only — does not block merge. Step 4a handles the merge prompt.
+
+### Gate 4: Feedback inbox and sprint evals surfaced
+
+```bash
+EVALS=".stackpilot/runs/${SLUG}/sprint-evals.md"
+OPEN_FEEDBACK=$(find .stackpilot/feedback/open -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+
+[ -f "${EVALS}" ] || { echo "❌ Gate 4: sprint-evals.md missing"; GATE_FAILED=1; }
+if [ "${OPEN_FEEDBACK}" -gt 0 ]; then
+  echo "⚠ Gate 4: ${OPEN_FEEDBACK} unresolved feedback file(s) remain in .stackpilot/feedback/open"
+fi
+```
+
+Missing `sprint-evals.md` blocks merge. Open feedback is a warning unless any
+file is HIGH or CRITICAL; unresolved HIGH/CRITICAL feedback blocks merge unless
+the user explicitly records an override reason.
+
+### Result
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━
+  Sprint Closure Gate
+━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Gate 1 (criteria)      all 5 green
+✅ Gate 2 (CHANGELOG)     3 scopes covered
+⚠️  Gate 3 (patterns)      2 candidates pending (handled in Step 4a)
+✅ Gate 4 (evals/feedback) evals written, no critical feedback
+━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+- All `✅` (or only `⚠️` warnings without HIGH/CRITICAL feedback) → proceed to Step 1
+- Any `❌` (`GATE_FAILED=1`) → present to user:
+  > "Closure gate failed: <reasons>. Fix before merge, or proceed anyway (override gate)?"
+  
+  If user fixes → return control, do not proceed until re-run shows green.
+  If user overrides → log override reason and proceed to Step 1.
+
+**Skip Step 0.5 only in:** auto mode B AND no criteria file exists (legacy sprint). Otherwise gates always run.
+
+## Step 1 — Detect dev server command
+
+Auto-detect from project files. Only detect when there is a clear web server signal.
+
+```
+Check in order, use the first match:
+1. package.json exists → read scripts:
+   a. Has "dev" script AND dependencies include vite/next/nuxt/webpack/remix/astro/svelte → npm run dev
+   b. Has "dev" script with no web framework signal → skip
+   c. No "dev" script → skip
+2. manage.py exists + contains "django" → python manage.py runserver
+3. Gemfile exists + config/routes.rb exists → bundle exec rails server
+4. No match → skip preview, go directly to Step 3
+```
+
+Do NOT blindly run `cargo run`, `go run .`, `python app.py`, or `npm start`.
+
+## Step 2 — Start server, verify response, present preview URL
+
+1. Start detected command in background, capture PID: `<command> & echo $!`
+2. Wait for output containing `http://localhost:` (timeout 15s)
+3. If no URL detected → kill process, skip preview
+4. **Auto-verify the URL responds** before handing off to the user:
+   ```bash
+   HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$URL" 2>/dev/null || echo "ERR")"
+   ```
+   - `2xx` or `3xx` → report `✅ URL responded (HTTP $HTTP_CODE)`
+   - `4xx` / `5xx` / `ERR` → report the code and the last 20 lines of the server log; ask user whether to proceed anyway or investigate
+5. Present to user:
+
+> "Sprint complete. All tests passing. Dev server running at:"
+>
+> `http://localhost:XXXX`  (PID: XXXX) — responded HTTP 200
+>
+> "Please review in your browser, then tell me how to proceed."
+
+**Wait for user to finish reviewing.**
+
+## Step 3 — Present finish decision
+
+Terminal A/B/C/D is the default because most finish decisions are textual.
+Generate a browser report only when it adds signal:
+
+- Many tasks, commits, criteria, decisions, or pattern candidates
+- Timeline/phase comparison is useful for reviewing the sprint
+- Sprint evals show retries, plateau/stuck notes, or strategy-change recommendation
+- Open feedback exists in `.stackpilot/feedback/open`
+- The user asks for a browser audit report
+- A prior dashboard is already open and the browser handoff will save review time
+
+For small sprints, print the compact terminal summary and A/B/C/D choices, then
+wait for the terminal reply.
+
+### 3a. Optional finish-report.html
+
+Aggregate sprint data into JSON, fill `references/views/finish-report.html`
+tokens, write to `.stackpilot/views/<slug>/finish-report.html`:
+
+```bash
+SLUG="<sprint-slug>"
+BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)
+BRANCH=$(git branch --show-current)
+EVENT_LOG=".stackpilot/runs/${SLUG}/events.jsonl"
+SHOULD_FINISH_REPORT="<yes-or-no-from-eligibility-gate>"
+
+if [ "${SHOULD_FINISH_REPORT}" = "yes" ]; then
+# Build DATA_JSON in a temp file (commits / tasks / criteria / sprint_evals / feedback / patterns / decisions / event log / branch)
+# Then sed-replace tokens in the template
+cp ~/Documents/github/stackpilot/claude-config/skills/stackpilot/references/views/finish-report.html \
+   ".stackpilot/views/${SLUG}/finish-report.html"
+# Tokens to replace: {{SPRINT_SLUG}}, {{BRANCH}}, {{DATA_JSON}}
+else
+  printf '{"ts":"%s","type":"finish-report-skipped","payload":{"reason":"terminal-summary-clearer"}}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_LOG}"
+fi
+```
+
+If Node 4 started the dashboard server, reuse that instance. If no server is
+running and the finish report is eligible, start the sprint server before
+printing `http://localhost:<port>/sprints/<slug>/finish-report.html`.
+
+Print the terminal summary and prompt in all cases. If HTML was generated,
+print the URL once alongside this prompt:
+
+> A. Squash merge into `${BASE}`
+> B. Push and create a PR
+> C. Leave as-is (handle later)
+> D. Discard (destructive — confirm first)
+>
+> Reply A/B/C/D here, or click in the browser if a report URL was printed.
+
+### 3b. Wait for action
+
+If HTML was generated, poll `.stackpilot/views/<slug>/finish-action.json` every
+2 seconds. **First to arrive wins** (HTML click or terminal reply). If 30
+seconds elapse with no action.json AND no terminal response, fall back to
+terminal-only prompt (do not regenerate the HTML; user can still type the
+choice). If HTML was skipped, wait only for terminal A/B/C/D.
+
+Record the final branch decision in the event log:
+
+```bash
+printf '{"ts":"%s","type":"decision","payload":{"gate":"finish","choice":"%s"}}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "<A|B|C|D>" >> "${EVENT_LOG}"
+```
+
+## Step 4 — Pre-merge commits on feature branch (A and B)
+
+Commit all housekeeping on the feature branch **before** touching the base branch. These commits will be squashed away and never appear on main.
+
+**4a. Architecture Memory Check:**
+
+> "需要更新 `.stackpilot/ARCHITECTURE.md` 吗？（结构 / 设计决策 / Conventions & Gotchas / Review Patterns 有变化都在这里更新）"
+> A. 要  B. 不用
+
+- **A**: Before editing, scan this sprint's agent completion reports:
+  - `sp-architect` reports — collect any `## Decision Candidates` blocks; surface as suggested additions to `## Key Design Decisions`
+  - `sp-qa` reports — collect any `## Pattern Candidates` blocks; surface as suggested additions to `## Review Patterns` (merge counts for "merge with existing" candidates, append as new entries for others; enforce the 20-entry cap by pruning lowest-count entries, ties broken by oldest)
+  - latest sprint spec — collect any `## Domain Language` entries for `.stackpilot/ARCHITECTURE.md`; surface durable project terms as suggested additions to `## Conventions & Gotchas` or `## Key Design Decisions` when they describe a hard boundary
+
+  Then update `.stackpilot/ARCHITECTURE.md` in-place — sections include Stack / Key Directories / Data Flow / Key Design Decisions / Conventions & Gotchas / Review Patterns. Commit:
+  ```bash
+  git add .stackpilot/ARCHITECTURE.md
+  git commit -m "docs(arch): update after sprint"
+  ```
+- **B**: Skip silently. Any surfaced Domain Language / Pattern Candidates / Decision Candidates are discarded — specs and agents will re-surface them next sprint if the underlying terms, issues, or decisions recur.
+
+**4b. Clear sprint artifacts:**
+
+```bash
+find .stackpilot/plans -name '*.md' -delete 2>/dev/null || true
+find .stackpilot/specs -name '*.md' -delete 2>/dev/null || true
+git add .stackpilot/
+git commit -m "chore(stackpilot): clear sprint artifacts"
+```
+
+Do not delete `.stackpilot/runs/` or `.stackpilot/feedback/` during this
+housekeeping step. Runs preserve eval/handoff evidence; feedback files preserve
+external audit state across sprints.
+
+## Step 5 — Execute choice
+
+- **A**: Squash merge — produces exactly one commit on base branch:
+  ```bash
+  # Action Safety Gate still applies: do not add force push, remote delete,
+  # production database actions, or credential movement to this path.
+  git checkout <base-branch>
+  git merge --squash <feature-branch>
+  git commit -m "<descriptive summary of the sprint>"
+  git branch -d <feature-branch>
+  ```
+- **B**: Push and create PR (squash merge policy enforced on the PR, not locally):
+  ```bash
+  git push -u origin <feature-branch>
+  # create PR — title becomes the squash commit message on merge
+  ```
+- **C**: Do nothing
+- **D**: Confirm once, then `git checkout <base-branch> && git branch -D <feature-branch>`
+
+## Step 6 — Stop dev server + sprint server
+
+```bash
+# Dev server (the project's app server started in Step 2, if any)
+kill <PID> 2>/dev/null
+
+# Sprint server (started in Node 4 of SKILL.md)
+bash ~/Documents/github/stackpilot/scripts/preview/stop-server.sh --slug "${SLUG}"
+```
+
+Stopping the sprint server removes `.stackpilot/views/<slug>/.server-info.json`
+so a future `/stackpilot` invocation won't try to reuse a dead server.
